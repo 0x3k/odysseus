@@ -610,7 +610,25 @@ def _append_llama_cpp_linux_accel_build_lines(runner_lines: list[str]) -> None:
     runner_lines.append('      }')
     runner_lines.append('      if _odysseus_has_cudart; then')
     runner_lines.append('        echo "[odysseus] CUDA nvcc + cudart found — building llama-server with CUDA (GPU) support..."')
-    runner_lines.append('        cmake -B build -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON && cmake --build build -j"$NPROC" --target llama-server && ln -sf ~/llama.cpp/build/bin/llama-server ~/bin/llama-server')
+    # The pip-installed CUDA wheels ship versioned runtime sonames
+    # (libcudart.so.13, libcublas.so.13, …) under nvidia/*/lib but never register
+    # them with ldconfig. cmake links libggml-cuda.so against them by full path,
+    # yet the FINAL llama-server link then fails to resolve those transitive
+    # sonames ("libcudart.so.13 … not found, try -rpath-link") — and even a
+    # successful link would not find them at runtime. Put every wheel lib dir on
+    # the linker search path (LIBRARY_PATH, plus LD_LIBRARY_PATH which GNU ld also
+    # consults for rpath-link), and bake an rpath so the binary is self-contained.
+    runner_lines.append('        _odysseus_cudalibs=""')
+    runner_lines.append('        for _libdir in ~/.local/lib/python*/site-packages/nvidia/*/lib; do')
+    runner_lines.append('          [ -d "$_libdir" ] && _odysseus_cudalibs="${_odysseus_cudalibs:+$_odysseus_cudalibs:}$_libdir"')
+    runner_lines.append('        done')
+    runner_lines.append('        _odysseus_rpath=""')
+    runner_lines.append('        if [ -n "$_odysseus_cudalibs" ]; then')
+    runner_lines.append('          export LIBRARY_PATH="$_odysseus_cudalibs${LIBRARY_PATH:+:$LIBRARY_PATH}"')
+    runner_lines.append('          export LD_LIBRARY_PATH="$_odysseus_cudalibs${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"')
+    runner_lines.append('          _odysseus_rpath="-DCMAKE_EXE_LINKER_FLAGS=-Wl,-rpath,$_odysseus_cudalibs -DCMAKE_SHARED_LINKER_FLAGS=-Wl,-rpath,$_odysseus_cudalibs"')
+    runner_lines.append('        fi')
+    runner_lines.append('        cmake -B build -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON $_odysseus_rpath && cmake --build build -j"$NPROC" --target llama-server && ln -sf ~/llama.cpp/build/bin/llama-server ~/bin/llama-server')
     runner_lines.append('      else')
     runner_lines.append('        echo "[odysseus] WARNING: nvcc found but CUDA runtime (libcudart.so) is not visible — building llama-server for CPU only."')
     runner_lines.append('        echo "[odysseus]   GPU inference will not be available for this llama.cpp build."')

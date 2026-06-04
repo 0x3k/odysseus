@@ -415,6 +415,32 @@ def test_llama_cpp_linux_bootstrap_cuda_cmake_present_when_cudart_found():
     assert 'CUDA nvcc + cudart found' in script
 
 
+def test_llama_cpp_linux_bootstrap_cuda_wires_wheel_lib_dirs_for_link_and_rpath():
+    """pip CUDA wheels ship versioned sonames (libcudart.so.13, …) that ldconfig
+    never sees; without their lib dirs on the linker path the final llama-server
+    link fails ("libcudart.so.13 … not found, try -rpath-link"), and without an
+    rpath the binary would not find them at runtime. The CUDA branch must collect
+    every nvidia/*/lib dir, export it on LIBRARY_PATH + LD_LIBRARY_PATH, and pass
+    it as an rpath to cmake."""
+    runner_lines = []
+    _append_llama_cpp_linux_accel_build_lines(runner_lines)
+    script = "\n".join(runner_lines)
+
+    # Collect the wheel lib dirs.
+    assert 'for _libdir in ~/.local/lib/python*/site-packages/nvidia/*/lib; do' in script
+    # Expose them at link time (LIBRARY_PATH) and for ld's rpath-link resolution
+    # of indirect sonames (LD_LIBRARY_PATH).
+    assert 'export LIBRARY_PATH="$_odysseus_cudalibs' in script
+    assert 'export LD_LIBRARY_PATH="$_odysseus_cudalibs' in script
+    # Bake an rpath so the resulting binary is self-contained at runtime.
+    assert '-DCMAKE_EXE_LINKER_FLAGS=-Wl,-rpath,$_odysseus_cudalibs' in script
+    assert '-DCMAKE_SHARED_LINKER_FLAGS=-Wl,-rpath,$_odysseus_cudalibs' in script
+    # The rpath flags must be wired into the CUDA cmake invocation, and the
+    # whole setup must precede it.
+    assert 'DGGML_CUDA=ON $_odysseus_rpath' in script
+    assert script.index('_odysseus_cudalibs=""') < script.index('DGGML_CUDA=ON')
+
+
 def test_llama_cpp_linux_bootstrap_nvcc_without_cudart_warns_and_falls_back():
     """When nvcc exists but cudart is absent, the script must warn and use CPU-only cmake."""
     runner_lines = []
