@@ -100,6 +100,7 @@ DEFAULT_SETTINGS = {
     # Tune via Settings or by editing data/settings.json.
     "research_run_timeout_seconds": 1800,
     "agent_max_tool_calls": 0,
+    "agent_max_rounds": 20,  # per-message agent step cap (clamped 1..200)
     "agent_input_token_budget": 6000,
     # Ceiling on the *auto-derived* input budget that #1230 introduced. Has
     # no effect when `agent_input_token_budget` is explicitly set (the user's
@@ -140,10 +141,17 @@ DEFAULT_SETTINGS = {
     # library can grow beyond this; cleanup/retirement is an explicit review flow.
     "skill_max_injected": 3,
     # Reminders
-    "reminder_channel": "browser",   # "browser" | "email" | "ntfy"
+    "reminder_channel": "browser",   # "browser" | "email" | "ntfy" | "webhook"
     "reminder_llm_synthesis": False,
     "reminder_ntfy_topic": "Reminders",
     "reminder_email_to": "",
+    # Generic outbound webhook channel: pick any saved Integration as the
+    # target and supply a JSON payload template. Use {{title}} and {{message}}
+    # as placeholders — they are JSON-escaped before substitution, so the
+    # rendered string is always valid JSON. Works with Discord, Slack, Teams,
+    # ntfy (JSON mode), or any service that accepts a POST with a JSON body.
+    "reminder_webhook_integration_id": "",
+    "reminder_webhook_payload_template": "",
     # Email triage scanner rules. Running/paused state and schedule live in
     # Tasks via the built-in `check_email_urgency` task.
     "urgent_email_prompt": (
