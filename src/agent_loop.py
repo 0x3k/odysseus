@@ -357,13 +357,13 @@ If the user asks for a reminder/alarm before the event, pass `reminder_minutes` 
 ```app_api
 {"action": "call", "method": "GET", "path": "/api/cookbook/gpus"}
 ```
-GENERIC LOOPBACK to ANY Odysseus internal endpoint. Use this whenever the user wants something the UI can do but there's NO named tool for it. Every UI button hits some /api/* endpoint — you can hit the same one. Auth is handled automatically.
+GENERIC LOOPBACK to allowed Odysseus internal endpoints. Use this whenever the user wants something the UI can do but there's NO named tool for it. Many UI buttons hit /api/* endpoints — you can hit allowed ones. Auth is handled automatically.
 
 **Discovery first.** If you're not sure of the path, call `{"action":"endpoints","filter":"<keyword>"}` (e.g. filter='calendar' or 'gallery' or 'theme') to list available endpoints with their methods + summaries. Then call with action='call'.
 
 **Common surfaces (use `endpoints` with filter to discover the full set per domain):**
 - Calendar: `/api/calendar/events`, `/api/calendar/calendars`, `/api/calendar/events/{uid}`
-- Cookbook: `/api/cookbook/gpus`, `/api/cookbook/state`, `/api/cookbook/setup`, `/api/cookbook/kill-pid`, `/api/cookbook/packages`, `/api/cookbook/hf-latest`, `/api/model/cached`
+- Cookbook: `/api/cookbook/gpus`, `/api/cookbook/state`, `/api/cookbook/setup`, `/api/cookbook/packages`, `/api/cookbook/hf-latest`, `/api/model/cached`. Do NOT use `app_api` for package installs, engine rebuilds, or PID signalling.
 - Gallery: `/api/gallery/list`, `/api/gallery/delete`, `/api/gallery/{id}`, `/api/gallery/albums`
 - Library / Documents: list all via `/api/documents/library`; docs in a session via `/api/documents/{session_id}`; a single doc via `/api/document/{id}` (singular) and its history via `/api/document/{id}/versions` (singular). Note the plural `/api/documents/...` vs singular `/api/document/{id}` split.
 - Memory: `/api/memory`, `/api/memory/{id}`, `/api/memory/search`
@@ -376,12 +376,13 @@ GENERIC LOOPBACK to ANY Odysseus internal endpoint. Use this whenever the user w
 - Compare: `/api/compare/sessions`, `/api/compare/start`
 - Email: use named email tools (`list_email_accounts`, `list_emails`, `read_email`, `send_email`, `reply_to_email`). Do NOT use `/api/email/accounts`; it is owner-filtered in tool context and may falsely return empty.
 - Endpoints (model providers): `/api/endpoints`, `/api/endpoints/{id}`
+- Shell: do NOT use `app_api` for `/api/shell/*`; use named command tooling instead.
 
 Body for POST/PUT/PATCH goes in `body` (object). Query params in `query` (object). Returns the parsed JSON of the response.
 
 **When to prefer named tools over app_api:** if a named wrapper exists (list_email_accounts, list_emails, read_email, manage_calendar, manage_notes, list_served_models, etc.) USE IT — it has nicer output formatting and clearer schema. Reach for `app_api` only when there's no wrapper for what you need.
 
-Blocked paths (refused for safety): /api/auth/, /api/users/, /api/tokens/, /api/admin/, /api/backup/restore, /api/email/accounts.""",
+Blocked paths/routes (refused for safety): /api/auth/, /api/users/, /api/tokens/, /api/admin/, /api/shell/, /api/backup/restore, /api/email/accounts, POST /api/cookbook/packages/install, POST /api/cookbook/rebuild-engine, POST /api/cookbook/kill-pid.""",
 }
 
 def get_builtin_overrides() -> dict:
@@ -1110,7 +1111,7 @@ def _build_base_prompt(
 
 
 
-def _resolve_tool_blocks(round_response: str, native_tool_calls: list, round_num: int):
+def _resolve_tool_blocks(round_response: str, native_tool_calls: list, round_num: int, is_api_model: bool = False):
     """Choose native function calls or fenced code block parsing. Returns (tool_blocks, used_native)."""
     used_native = False
     if native_tool_calls:
@@ -1127,7 +1128,21 @@ def _resolve_tool_blocks(round_response: str, native_tool_calls: list, round_num
         if tool_blocks:
             used_native = True
     if not used_native:
-        tool_blocks = parse_tool_blocks(round_response)
+        # Native function-calling models (GPT/Claude/Grok/Qwen3/DeepSeek-V, etc.)
+        # have a reliable structured channel for real tool invocations. When such
+        # a model emits no native tool_calls, any ```bash/```python/```json fence
+        # in its prose is virtually always an illustrative example for the user
+        # (e.g. "here's the command you'd run"), not an attempted tool call —
+        # executing it causes accidental runs and clarification loops (#3222).
+        #
+        # Gate ONLY that fenced-block pattern for native models, not the whole
+        # parser: explicit [TOOL_CALL]/<invoke>/<tool_code>/DSML markup that
+        # leaks into content as text is never illustrative — it's a real call
+        # the model couldn't emit on its structured channel (e.g. DeepSeek-V
+        # falling back to DSML). Dropping the whole parser would silently lose
+        # those too. Non-native / textual-only models keep every pattern,
+        # fenced blocks included, since that's their *only* tool channel.
+        tool_blocks = parse_tool_blocks(round_response, skip_fenced=is_api_model)
         if tool_blocks:
             logger.info(f"Agent round {round_num}: {len(tool_blocks)} fenced tool block(s) detected")
 
@@ -1434,6 +1449,18 @@ def build_active_plan_note(approved_plan: str) -> str:
         "Current plan:\n"
         + approved_plan.strip()
     )
+
+
+def _detect_runaway_call(call_freq, threshold=15):
+    """Tool name of a call signature repeated >= ``threshold`` times — a real
+    runaway loop. Counts IDENTICAL repeated calls (same tool AND args), so a
+    legitimate batch of distinct calls to one tool (e.g. creating 18 calendar
+    events at once) is NOT flagged. Returns ``None`` when nothing is runaway.
+
+    ``call_freq`` is a Counter keyed by ``"{tool_type}:{content[:120]}"``.
+    """
+    sig = next((s for s, n in call_freq.items() if n >= threshold), None)
+    return sig.split(":", 1)[0] if sig else None
 
 
 async def stream_agent_loop(
@@ -1773,7 +1800,10 @@ async def stream_agent_loop(
     # signatures + consecutive no-text tool rounds to bail early.
     _recent_call_sigs = collections.deque(maxlen=6)
     _stuck_rounds = 0
-    _tool_type_counts: collections.Counter = collections.Counter()
+    # Frequency of each exact call signature (tool + args), for the runaway
+    # backstop. Counting identical repeats — not distinct same-tool calls —
+    # lets a legit batch (e.g. 18 calendar events at once) through.
+    _call_freq: collections.Counter = collections.Counter()
     _THINK_RE = re.compile(r'<think>.*?</think>', re.DOTALL | re.IGNORECASE)
     _force_answer = False  # set by loop-breaker → next round runs with NO tools
     # Supervisor: how many times we've nudged the model after it announced
@@ -2037,7 +2067,7 @@ async def stream_agent_loop(
                 yield chunk
             # Intercept [DONE] — don't forward until all rounds finish
 
-        tool_blocks, used_native = _resolve_tool_blocks(round_response, native_tool_calls, round_num)
+        tool_blocks, used_native = _resolve_tool_blocks(round_response, native_tool_calls, round_num, is_api_model=_is_api_model)
 
         # Force-answer round: we told the model to STOP calling tools and
         # answer. If it ignored that and emitted a (possibly DSML) tool
@@ -2116,7 +2146,12 @@ async def stream_agent_loop(
 
         # Save cleaned round text for history persistence
         # Keep <think> blocks so they render in the thinking section on reload
-        cleaned_round = strip_tool_blocks(round_response).strip()
+        # Mirror the same fenced-pattern gate used to resolve tool_blocks above:
+        # an illustrative fence that wasn't executed (because this is a native
+        # model with no real native_tool_calls) must not be stripped from the
+        # persisted text either — otherwise it streams once and then disappears
+        # on reload (#3222 follow-up).
+        cleaned_round = strip_tool_blocks(round_response, skip_fenced=(_is_api_model and not used_native)).strip()
         round_texts.append(cleaned_round)
 
         if not tool_blocks:
@@ -2220,7 +2255,7 @@ async def stream_agent_loop(
         _is_repeat = _sig in _recent_call_sigs
         _recent_call_sigs.append(_sig)
         for _b in tool_blocks:
-            _tool_type_counts[_b.tool_type] += 1
+            _call_freq[f"{_b.tool_type}:{(_b.content or '').strip()[:120]}"] += 1
         # "Real" answer text = round text minus <think> blocks. Empty-think
         # rounds (just "<think>\n\n</think>" + a tool call) must not read as
         # progress, so strip think before checking.
@@ -2231,9 +2266,12 @@ async def stream_agent_loop(
             _stuck_rounds += 1
         else:
             _stuck_rounds = 0
-        _runaway = next((t for t, n in _tool_type_counts.items() if n >= 15), None)
+        # Runaway = the SAME exact call repeated an absurd number of times.
+        # Distinct calls to one tool (a real batch) are legitimate work, so we
+        # count identical call signatures, not raw per-tool-type totals.
+        _runaway = _detect_runaway_call(_call_freq)
         if _stuck_rounds >= 4 or _runaway:
-            reason = (f"calling {_runaway} over and over" if _runaway
+            reason = (f"calling {_runaway} with identical arguments over and over" if _runaway
                       else "repeating the same tool calls without new progress")
             logger.warning(f"[agent] loop-breaker tripped on round {round_num} ({reason}); sig={_sig[:80]!r}")
             # The model has been executing tools, so its results are already
